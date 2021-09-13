@@ -1,7 +1,206 @@
+// ignore_for_file: deprecated_member_use_from_same_package
 import 'dart:async';
 
 import 'package:bloc/bloc.dart';
 import 'package:meta/meta.dart';
+
+/// {@template emitter}
+/// Base interface for emitting states in response to events.
+/// {@endtemplate}
+abstract class Emitter<State> {
+  /// Subscribes to the provided [stream] and invokes the [onData] callback
+  /// when the [stream] emits new data.
+  ///
+  /// [onEach] completes when the event handler is cancelled or when
+  /// the provided [stream] has ended.
+  ///
+  /// If [onError] is omitted, any errors on this [stream]
+  /// are considered unhandled, and will be thrown by [onEach].
+  /// As a result, the internal subscription to the [stream] will be canceled.
+  ///
+  /// If [onError] is provided, any errors on this [stream] will be passed on to
+  /// [onError] and will not result in unhandled exceptions or cancelations to
+  /// the internal stream subscription.
+  ///
+  /// **Note**: The stack trace argument may be [StackTrace.empty]
+  /// if the [stream] received an error without a stack trace.
+  Future<void> onEach<T>(
+    Stream<T> stream, {
+    required void Function(T data) onData,
+    void Function(Object error, StackTrace stackTrace)? onError,
+  });
+
+  // Subscribes to the provided [stream] and invokes the [onData] callback
+  /// when the [stream] emits new data and the result of [onData] is emitted.
+  ///
+  /// [forEach] completes when the event handler is cancelled or when
+  /// the provided [stream] has ended.
+  ///
+  /// If [onError] is omitted, any errors on this [stream]
+  /// are considered unhandled, and will be thrown by [forEach].
+  /// As a result, the internal subscription to the [stream] will be canceled.
+  ///
+  /// If [onError] is provided, any errors on this [stream] will be passed on to
+  /// [onError] and will not result in unhandled exceptions or cancelations to
+  /// the internal stream subscription.
+  ///
+  /// **Note**: The stack trace argument may be [StackTrace.empty]
+  /// if the [stream] received an error without a stack trace.
+  Future<void> forEach<T>(
+    Stream<T> stream, {
+    required State Function(T data) onData,
+    State Function(Object error, StackTrace stackTrace)? onError,
+  });
+
+  /// Whether the [EventHandler] associated with this [Emitter]
+  /// has been completed or canceled.
+  bool get isDone;
+
+  /// Emits the provided [state].
+  void call(State state);
+}
+
+/// An event handler is responsible for reacting to an incoming [Event]
+/// and can emit zero or more states via the [Emitter].
+typedef EventHandler<Event, State> = FutureOr<void> Function(
+  Event event,
+  Emitter<State> emit,
+);
+
+/// Signature for a function which converts an incoming event
+/// into an outbound stream of events.
+/// Used when defining custom [EventTransformer]s.
+typedef EventMapper<Event> = Stream<Event> Function(Event event);
+
+/// Used to change how events are processed.
+/// By default events are processed concurrently.
+typedef EventTransformer<Event> = Stream<Event> Function(
+  Stream<Event> events,
+  EventMapper<Event> mapper,
+);
+
+class _Emitter<State> implements Emitter<State> {
+  _Emitter(this._emit);
+
+  final void Function(State) _emit;
+  final _completer = Completer<void>();
+  final _disposables = <FutureOr<void> Function()>[];
+
+  var _isCanceled = false;
+  var _isCompleted = false;
+
+  @override
+  Future<void> onEach<T>(
+    Stream<T> stream, {
+    required void Function(T) onData,
+    void Function(Object error, StackTrace stackTrace)? onError,
+  }) async {
+    final completer = Completer<void>();
+    final subscription = stream.listen(
+      onData,
+      onDone: completer.complete,
+      onError: onError ?? completer.completeError,
+      cancelOnError: onError == null,
+    );
+    _disposables.add(subscription.cancel);
+    return Future.any([future, completer.future]).whenComplete(() {
+      subscription.cancel();
+      _disposables.remove(subscription.cancel);
+    });
+  }
+
+  @override
+  Future<void> forEach<T>(
+    Stream<T> stream, {
+    required State Function(T) onData,
+    State Function(Object error, StackTrace stackTrace)? onError,
+  }) {
+    return onEach<T>(
+      stream,
+      onData: (data) => call(onData(data)),
+      onError: onError != null
+          ? (Object error, StackTrace stackTrace) {
+              call(onError(error, stackTrace));
+            }
+          : null,
+    );
+  }
+
+  @override
+  void call(State state) {
+    assert(
+      !_isCompleted,
+      '''\n\n
+emit was called after an event handler completed normally.
+This is usually due to an unawaited future in an event handler.
+Please make sure to await all asynchronous operations with event handlers
+and use emit.isDone after asynchronous operations before calling emit() to
+ensure the event handler has not completed.
+
+  **BAD**
+  on<Event>((event, emit) {
+    future.whenComplete(() => emit(...));
+  });
+
+  **GOOD**
+  on<Event>((event, emit) async {
+    await future.whenComplete(() => emit(...));
+  });
+''',
+    );
+    if (!_isCanceled) _emit(state);
+  }
+
+  @override
+  bool get isDone => _isCanceled || _isCompleted;
+
+  void cancel() {
+    if (isDone) return;
+    _isCanceled = true;
+    _close();
+  }
+
+  void complete() {
+    if (isDone) return;
+    assert(
+      _disposables.isEmpty,
+      '''\n\n
+An event handler completed but left pending subscriptions behind.
+This is most likely due to an unawaited emit.forEach or emit.onEach. 
+Please make sure to await all asynchronous operations within event handlers.
+
+  **BAD**
+  on<Event>((event, emit) {
+    emit.forEach(...);
+  });  
+  
+  **GOOD**
+  on<Event>((event, emit) async {
+    await emit.forEach(...);
+  });
+
+  **GOOD**
+  on<Event>((event, emit) {
+    return emit.forEach(...);
+  });
+
+  **GOOD**
+  on<Event>((event, emit) => emit.forEach(...));
+
+''',
+    );
+    _isCompleted = true;
+    _close();
+  }
+
+  void _close() {
+    for (final disposable in _disposables) disposable.call();
+    _disposables.clear();
+    if (!_completer.isCompleted) _completer.complete();
+  }
+
+  Future<void> get future => _completer.future;
+}
 
 /// Signature for a mapper function which takes an [Event] as input
 /// and outputs a [Stream] of [Transition] objects.
@@ -51,9 +250,23 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
   /// The current [BlocObserver] instance.
   static BlocObserver observer = BlocObserver();
 
+  /// The default [EventTransformer] used for all event handlers.
+  /// By default all events are processed concurrently.
+  ///
+  /// If a custom transformer is specified for a particular event handler,
+  /// it will take precendence over the global transformer.
+  static EventTransformer<dynamic> transformer = (events, mapper) {
+    return events
+        .map(mapper)
+        .transform<dynamic>(const _FlatMapStreamTransformer<dynamic>());
+  };
+
   StreamSubscription<Transition<Event, State>>? _transitionSubscription;
 
   final _eventController = StreamController<Event>.broadcast();
+  final _subscriptions = <StreamSubscription<dynamic>>[];
+  final _handlerTypes = <Type>[];
+  final _emitters = <_Emitter>[];
 
   /// Notifies the [Bloc] of a new [event] which triggers [mapEventToState].
   /// If [close] has already been called, any subsequent calls to [add] will
@@ -93,6 +306,9 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
     observer.onEvent(this, event);
   }
 
+  /// **@Deprecated - Use `on<Event>` with an `EventTransformer` instead.
+  /// Will be removed in v8.0.0**
+  ///
   /// Transforms the [events] stream along with a [transitionFn] function into
   /// a `Stream<Transition>`.
   /// Events that should be processed by [mapEventToState] need to be passed to
@@ -125,6 +341,10 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
   ///   );
   /// }
   /// ```
+  @Deprecated(
+    'Use `on<Event>` with an `EventTransformer` instead. '
+    'Will be removed in v8.0.0',
+  )
   Stream<Transition<Event, State>> transformEvents(
     Stream<Event> events,
     TransitionFunction<Event, State> transitionFn,
@@ -144,11 +364,89 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
   @override
   void emit(State state) => super.emit(state);
 
+  /// Register event handler for an event of type `E`.
+  /// There should only ever be one event handler per event type `E`.
+  ///
+  /// * A [StateError] will be thrown if there are multiple event handlers
+  /// registered for the same type `E`.
+  ///
+  /// * A [StateError] will be thrown if there is a missing event handler for
+  /// an event of type `E` when [add] is called.
+  ///
+  /// By default, events will be processed concurrently.
+  ///
+  /// See also:
+  ///
+  /// * [EventTransformer] to customize how events are processed.
+  void on<E extends Event>(
+    EventHandler<E, State> handler, {
+    EventTransformer<Event>? transformer,
+  }) {
+    assert(() {
+      final handlerExists = _handlerTypes.any((type) => type == E);
+      if (handlerExists) {
+        throw StateError(
+          'on<$E> was called multiple times. '
+          'There should only be a single event handler per event type.',
+        );
+      }
+      _handlerTypes.add(E);
+      return true;
+    }());
+
+    final _transformer = transformer ?? Bloc.transformer;
+    final subscription = _transformer(
+      _eventController.stream.where((event) => event is E),
+      (dynamic event) {
+        void onEmit(State state) {
+          if (isClosed) return;
+          if (this.state == state && _emitted) return;
+          onTransition(Transition(
+            currentState: this.state,
+            event: event as E,
+            nextState: state,
+          ));
+          emit(state);
+        }
+
+        final emitter = _Emitter(onEmit);
+        final controller = StreamController<Event>.broadcast(
+          sync: true,
+          onCancel: emitter.cancel,
+        );
+
+        void handleEvent() async {
+          void onDone() {
+            emitter.complete();
+            _emitters.remove(emitter);
+            if (!controller.isClosed) controller.close();
+          }
+
+          try {
+            _emitters.add(emitter);
+            await handler(event as E, emitter);
+          } catch (error, stackTrace) {
+            onError(error, stackTrace);
+          } finally {
+            onDone();
+          }
+        }
+
+        handleEvent();
+        return controller.stream;
+      },
+    ).listen(null);
+    _subscriptions.add(subscription);
+  }
+
+  /// **@Deprecated - Use on<Event> instead. Will be removed in v8.0.0**
+  ///
   /// Must be implemented when a class extends [Bloc].
   /// [mapEventToState] is called whenever an [event] is [add]ed
   /// and is responsible for converting that [event] into a new [state].
   /// [mapEventToState] can `yield` zero, one, or multiple states for an event.
-  Stream<State> mapEventToState(Event event);
+  @Deprecated('Use on<Event> instead. Will be removed in v8.0.0')
+  Stream<State> mapEventToState(Event event) async* {}
 
   /// Called whenever a [transition] occurs with the given [transition].
   /// A [transition] occurs when a new `event` is [add]ed and [mapEventToState]
@@ -178,6 +476,9 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
     Bloc.observer.onTransition(this, transition);
   }
 
+  /// **@Deprecated - Override `Stream<State> get stream` instead.
+  /// Will be removed in v8.0.0**
+  ///
   /// Transforms the `Stream<Transition>` into a new `Stream<Transition>`.
   /// By default [transformTransitions] returns
   /// the incoming `Stream<Transition>`.
@@ -195,6 +496,9 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
   ///   return transitions.debounceTime(Duration(seconds: 1));
   /// }
   /// ```
+  @Deprecated(
+    'Override `Stream<State> get stream` instead. Will be removed in v8.0.0',
+  )
   Stream<Transition<Event, State>> transformTransitions(
     Stream<Transition<Event, State>> transitions,
   ) {
@@ -211,11 +515,26 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
   @mustCallSuper
   Future<void> close() async {
     await _eventController.close();
+    for (final emitter in _emitters) emitter.cancel();
+    await Future.wait<void>(_emitters.map((e) => e.future));
+    await Future.wait<void>(_subscriptions.map((s) => s.cancel()));
     await _transitionSubscription?.cancel();
     return super.close();
   }
 
   void _bindEventsToStates() {
+    void assertNoMixedUsage() {
+      assert(() {
+        if (_handlerTypes.isNotEmpty) {
+          throw StateError(
+            'mapEventToState cannot be overridden in '
+            'conjunction with on<Event>.',
+          );
+        }
+        return true;
+      }());
+    }
+
     _transitionSubscription = transformTransitions(
       transformEvents(
         _eventController.stream,
@@ -231,6 +550,7 @@ abstract class Bloc<Event, State> extends BlocBase<State> {
       (transition) {
         if (transition.nextState == state && _emitted) return;
         try {
+          assertNoMixedUsage();
           onTransition(transition);
           emit(transition.nextState);
         } catch (error, stackTrace) {
@@ -401,5 +721,50 @@ abstract class BlocBase<State> {
     // ignore: invalid_use_of_protected_member
     Bloc.observer.onClose(this);
     await _stateController.close();
+  }
+}
+
+class _FlatMapStreamTransformer<T> extends StreamTransformerBase<Stream<T>, T> {
+  const _FlatMapStreamTransformer();
+
+  @override
+  Stream<T> bind(Stream<Stream<T>> stream) {
+    final controller = StreamController<T>.broadcast(sync: true);
+
+    controller.onListen = () {
+      final subscriptions = <StreamSubscription<dynamic>>[];
+
+      final outerSubscription = stream.listen(
+        (inner) {
+          final subscription = inner.listen(
+            controller.add,
+            onError: controller.addError,
+          );
+
+          subscription.onDone(() {
+            subscriptions.remove(subscription);
+            if (subscriptions.isEmpty) controller.close();
+          });
+
+          subscriptions.add(subscription);
+        },
+        onError: controller.addError,
+      );
+
+      outerSubscription.onDone(() {
+        subscriptions.remove(outerSubscription);
+        if (subscriptions.isEmpty) controller.close();
+      });
+
+      subscriptions.add(outerSubscription);
+
+      controller.onCancel = () {
+        if (subscriptions.isEmpty) return null;
+        final cancels = [for (final s in subscriptions) s.cancel()];
+        return Future.wait(cancels).then((_) {});
+      };
+    };
+
+    return controller.stream;
   }
 }
